@@ -1,0 +1,21 @@
+{
+  "idf.port": "/dev/ttyUSB0",
+  "idf.openOcdConfigs": [
+    "board/esp32s3-builtin.cfg"
+  ],
+  "idf.customExtraVars": {
+    "OPENOCD_SCRIPTS": "/home/poklau/.espressif/tools/openocd-esp32/v0.12.0-esp32-20240318/openocd-esp32/share/openocd/scripts",
+    "ESP_ROM_ELF_DIR": "/home/poklau/.espressif/tools/esp-rom-elfs/20230320/",
+    "IDF_TARGET": "esp32s3"
+  },
+  "clangd.path": "/home/poklau/.espressif/tools/esp-clang/esp-19.1.2_20250312/esp-clang/bin/clangd",
+  "clangd.arguments": [
+    "--background-index",
+    "--query-driver=/home/poklau/.espressif/tools/xtensa-esp-elf/esp-14.2.0_20241119/xtensa-esp-elf/bin/xtensa-esp32s3-elf-gcc",
+    "--compile-commands-dir=/home/poklau/esp-skainet/examples/direction_of_arrival/build"
+  ],
+  "files.associations": {
+    "esp_nsn_models.h": "c",
+    "ringbuf.h": "c"
+  }
+}
