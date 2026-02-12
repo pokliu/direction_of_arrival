@@ -407,7 +407,34 @@ void app_main()
     srmodel_list_t *models = esp_srmodel_init("model");
     afe_config_t *afe_config = afe_config_init(esp_get_input_format(), models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
     printf("%s\n", esp_get_input_format());
-    afe_config->aec_init = false;
+    afe_config->aec_init = true;
+    afe_config->aec_mode = AEC_MODE_SR_LOW_COST;
+    afe_config->se_init = true;
+    afe_config->ns_init = true;
+    afe_config->ns_model_name = "nsnet2";
+    afe_config->afe_ns_mode = AFE_NS_MODE_NET;
+    afe_config->vad_init = true;
+    afe_config->vad_mode = VAD_MODE_0;
+    afe_config->vad_model_name = "vadnet1_medium";
+    afe_config->vad_min_speech_ms = 128;
+    afe_config->vad_min_noise_ms = 1000;
+    afe_config->vad_delay_ms = 128;
+    afe_config->vad_mute_playback = false;
+    afe_config->vad_enable_channel_trigger = false;
+    afe_config->wakenet_init = true;
+    afe_config->wakenet_model_name = "wn9s_hilexin";
+    // LOW_COST 模式下当前 AFE 最多支持 2 路 MIC，需使用 2CH 检测模式
+    afe_config->wakenet_mode = DET_MODE_2CH_90;
+    afe_config->pcm_config.total_ch_num = esp_get_feed_channel();
+    afe_config->pcm_config.mic_num = 2;
+    afe_config->pcm_config.mic_ids = (uint8_t*)malloc(2 * sizeof(uint8_t));
+    afe_config->pcm_config.mic_ids[0] = 1;
+    afe_config->pcm_config.mic_ids[1] = 2;
+    // 第 3 路麦克风不参与 AFE，避免与 2MIC 限制冲突
+    afe_config->pcm_config.ref_num = 1;
+    afe_config->pcm_config.ref_ids = (uint8_t*)malloc(1 * sizeof(uint8_t));
+    afe_config->pcm_config.ref_ids[0] = 0;
+    afe_config->pcm_config.sample_rate = SAMPLE_RATE_HZ;
     afe_config_print(afe_config);
     afe_handle = esp_afe_handle_from_config(afe_config);
     esp_afe_sr_data_t *afe_data = afe_handle->create_from_config(afe_config);
