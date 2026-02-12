@@ -39,7 +39,7 @@
 // 两个 DOA 麦克风之间的物理间距（米）
 #define DOA_MIC_DISTANCE_M           0.065f
 // 唤醒后回放窗口长度（毫秒）
-#define WAKEWORD_REPLAY_MS           900
+#define WAKEWORD_REPLAY_MS           1000
 // 唤醒后用于 DOA 估算的窗口长度（毫秒）
 #define WAKEWORD_DOA_WINDOW_MS       500
 // 两次唤醒触发之间的最小间隔（毫秒），用于防抖
@@ -359,6 +359,7 @@ void detect_Task(void *arg)
             printf("fetch error!\n");
             continue;
         }
+        esp_audio_play(res->data, res->data_size, portMAX_DELAY);
 
         if (res->wakeup_state == WAKENET_DETECTED) {
             // 冷却时间内忽略重复触发，避免连续回放/连续打印
@@ -379,7 +380,7 @@ void detect_Task(void *arg)
             int replay_samples = raw_mic_ring_copy_recent_channel(replay_linear, replay_total_samples, g_playback_ch_idx);
             if (replay_samples > 0) {
                 // esp_audio_play 的长度单位是“字节”
-                esp_audio_play(replay_linear, replay_samples * sizeof(int16_t), portMAX_DELAY);
+                // esp_audio_play(replay_linear, replay_samples * sizeof(int16_t), portMAX_DELAY);
             }
 
             // DOA 只在唤醒时估算，窗口同样聚焦在唤醒词附近
@@ -405,26 +406,32 @@ void app_main()
 
     // 初始化语音模型与 AFE
     srmodel_list_t *models = esp_srmodel_init("model");
-    afe_config_t *afe_config = afe_config_init(esp_get_input_format(), models, AFE_TYPE_SR, AFE_MODE_LOW_COST);
+    afe_config_t *afe_config = afe_config_init(esp_get_input_format(), models, AFE_TYPE_VC, AFE_MODE_HIGH_PERF);
     printf("%s\n", esp_get_input_format());
     afe_config->aec_init = true;
-    afe_config->aec_mode = AEC_MODE_SR_LOW_COST;
-    afe_config->se_init = true;
+    afe_config->aec_mode = AEC_MODE_SR_HIGH_PERF;
+    afe_config->se_init = false;
     afe_config->ns_init = true;
     afe_config->ns_model_name = "nsnet2";
     afe_config->afe_ns_mode = AFE_NS_MODE_NET;
-    afe_config->vad_init = true;
+    afe_config->vad_init = false;
     afe_config->vad_mode = VAD_MODE_0;
     afe_config->vad_model_name = "vadnet1_medium";
-    afe_config->vad_min_speech_ms = 128;
+    afe_config->vad_min_speech_ms = 32;
     afe_config->vad_min_noise_ms = 1000;
-    afe_config->vad_delay_ms = 128;
+    afe_config->vad_delay_ms = 10;
     afe_config->vad_mute_playback = false;
     afe_config->vad_enable_channel_trigger = false;
-    afe_config->wakenet_init = true;
+    afe_config->wakenet_init = false;
     afe_config->wakenet_model_name = "wn9s_hilexin";
     // LOW_COST 模式下当前 AFE 最多支持 2 路 MIC，需使用 2CH 检测模式
     afe_config->wakenet_mode = DET_MODE_2CH_90;
+
+    afe_config->agc_init = true;
+    afe_config->agc_mode = AFE_AGC_MODE_WAKENET;
+    afe_config->agc_compression_gain_db = 9;
+    afe_config->agc_target_level_dbfs = 3;
+
     afe_config->pcm_config.total_ch_num = esp_get_feed_channel();
     afe_config->pcm_config.mic_num = 2;
     afe_config->pcm_config.mic_ids = (uint8_t*)malloc(2 * sizeof(uint8_t));
