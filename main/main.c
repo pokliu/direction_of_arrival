@@ -12,6 +12,7 @@
 #pragma GCC diagnostic ignored "-Wreturn-mismatch"
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,8 @@
 #define SAMPLE_RATE_HZ               16000
 // 回放通道索引（基于 raw feed 多通道顺序，RMMM 时: 0=R, 1=M0, 2=M1, 3=M2）
 #define RAW_PLAYBACK_FEED_CH_INDEX    3
+// 每次唤醒时是否打印 raw 各通道电平统计（RMS/Peak），用于排查“某通道声音小”
+#define DEBUG_PRINT_WAKE_CHANNEL_LEVEL 1
 
 static const esp_afe_sr_iface_t *afe_handle = NULL;
 static volatile int task_flag = 0;
@@ -164,6 +167,55 @@ static int raw_mic_ring_copy_recent_channel(int16_t *out_channel, int window_sam
 
     free(snapshot);
     return copied_frames;
+}
+
+/**
+ * @brief 调试辅助：打印最近窗口内每个通道的 RMS 与峰值。
+ *
+ * 用途：
+ * - 快速判断 RAW_PLAYBACK_FEED_CH_INDEX 选中的通道是不是天然电平偏小
+ * - 辅助确认当前板卡上的 raw 通道映射（哪路是参考，哪路是麦）
+ */
+static void debug_print_recent_channel_levels(int window_samples)
+{
+    if (g_feed_channel_count <= 0 || window_samples <= 0) {
+        return;
+    }
+
+    int16_t *snapshot = malloc(window_samples * g_feed_channel_count * sizeof(int16_t));
+    if (!snapshot) {
+        return;
+    }
+
+    int frames = raw_mic_ring_copy_recent_interleaved(snapshot, window_samples, g_feed_channel_count);
+    if (frames <= 0) {
+        free(snapshot);
+        return;
+    }
+
+    char *fmt = esp_get_input_format();
+    printf("raw level stats (frames=%d):\n", frames);
+    for (int ch = 0; ch < g_feed_channel_count; ch++) {
+        double sum_sq = 0.0;
+        int peak = 0;
+        for (int i = 0; i < frames; i++) {
+            int v = snapshot[i * g_feed_channel_count + ch];
+            int a = (v >= 0) ? v : -v;
+            if (a > peak) {
+                peak = a;
+            }
+            sum_sq += (double)v * (double)v;
+        }
+        int rms = (int)sqrt(sum_sq / frames);
+        printf("  ch%d('%c'): rms=%d peak=%d%s\n",
+               ch,
+               fmt[ch],
+               rms,
+               peak,
+               (ch == g_playback_ch_idx) ? "  <-- playback" : "");
+    }
+
+    free(snapshot);
 }
 
 /**
@@ -319,6 +371,9 @@ void detect_Task(void *arg)
             printf("wakeword detected\n");
             printf("model index:%d, word index:%d\n", res->wakenet_model_index, res->wake_word_index);
             printf("-----------PLAY WAKE WORD AUDIO-----------\n");
+#if DEBUG_PRINT_WAKE_CHANNEL_LEVEL
+            debug_print_recent_channel_levels(replay_total_samples);
+#endif
 
             // 回放源：raw ring 指定通道（原始麦克风数据），不是 AFE 单声道输出
             int replay_samples = raw_mic_ring_copy_recent_channel(replay_linear, replay_total_samples, g_playback_ch_idx);
