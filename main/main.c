@@ -45,10 +45,8 @@
 #define WAKE_REPLAY_COOLDOWN_MS      1500
 // 本示例采样率
 #define SAMPLE_RATE_HZ               16000
-// 回放通道索引（基于 raw feed 多通道顺序，默认使用第 1 个 'M' 麦通道）
-#define RAW_PLAYBACK_USE_M_POS        1
-#define RAW_PLAYBACK_FEED_CH_INDEX    0
-#define RAW_PLAYBACK_M_POS_INDEX      0
+// 回放通道索引（基于 raw feed 多通道顺序，RMMM 时: 0=R, 1=M0, 2=M1, 3=M2）
+#define RAW_PLAYBACK_FEED_CH_INDEX    3
 
 static const esp_afe_sr_iface_t *afe_handle = NULL;
 static volatile int task_flag = 0;
@@ -246,7 +244,8 @@ void feed_Task(void *arg)
     assert(i2s_buff);
 
 
-    // 输入格式示例: "RMNM"，其中 'M' 表示麦克风通道
+    // 输入格式来自 bsp_get_input_format()，这里是 raw feed 顺序（is_get_raw_channel=true）
+    // 当前 BSP 配置为 "RMMM"；若走 is_get_raw_channel=false 的重排顺序才是 "MMMR"
     char* str = esp_get_input_format();
     int length = nch;
     int positions[10];
@@ -265,19 +264,13 @@ void feed_Task(void *arg)
     }
     g_mic_idx_left = positions[0];
     g_mic_idx_right = positions[1];
-    // 决定回放通道：
-    // 1) 按 M 麦位置选；或 2) 按固定 feed 通道索引选
-#if RAW_PLAYBACK_USE_M_POS
-    if (RAW_PLAYBACK_M_POS_INDEX == 0) {
-        g_playback_ch_idx = g_mic_idx_left;
-    } else {
-        g_playback_ch_idx = g_mic_idx_right;
-    }
-#else
+    // 回放固定使用 raw feed 的指定通道索引
     g_playback_ch_idx = RAW_PLAYBACK_FEED_CH_INDEX;
-#endif
     if (g_playback_ch_idx < 0 || g_playback_ch_idx >= feed_channel) {
         g_playback_ch_idx = g_mic_idx_left;
+    }
+    if (str[g_playback_ch_idx] != 'M') {
+        printf("Warning: playback channel ch%d is '%c' (not microphone)\n", g_playback_ch_idx, str[g_playback_ch_idx]);
     }
     printf("DOA mic pair: ch%d ch%d, playback channel: ch%d\n", g_mic_idx_left, g_mic_idx_right, g_playback_ch_idx);
 

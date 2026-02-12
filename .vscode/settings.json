@@ -17,5 +17,6 @@
   "files.associations": {
     "esp_nsn_models.h": "c",
     "ringbuf.h": "c"
-  }
+  },
+  "idf.flashPartitionToUse": "app"
 }

@@ -19,8 +19,6 @@
 #include <unistd.h>
 #include "bsp_board.h"
 #include "esp_err.h"
-#include "esp_vfs_fat.h"
-#include "sdmmc_cmd.h"
 #include "esp_board_init.h"
 
 static const char *TAG = "hardware";

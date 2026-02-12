@@ -19,17 +19,13 @@
 #include "bsp_board.h"
 #if ESP_IDF_VERSION >= ESP_IDF_VERSION_VAL(5, 0, 0)
 #include "driver/i2s_std.h"
-#include "driver/i2s_tdm.h"
 #include "soc/soc_caps.h"
 #else
 #include "driver/i2s.h"
 #endif
-#include "driver/gpio.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "driver/i2c.h"
-#include "esp_rom_sys.h"
-#include "esp_check.h"
 #include "esp_vfs_fat.h"
 #include "sdmmc_cmd.h"
 #if ((SOC_SDMMC_HOST_SUPPORTED) && (FUNC_SDMMC_EN))
@@ -112,10 +108,10 @@ esp_err_t bsp_codec_adc_init(int sample_rate)
         .bits_per_sample = 32,
     };
     esp_codec_dev_open(record_dev, &fs);
-    // 固定麦克风增益到 42dB，便于远场唤醒词采集
+    // 固定麦克风增益到 42dB，使用 3 麦 + 1 参考通道
     esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), 42.0);
     esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1), 42.0);
-    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2), 0.0);   // reference
+    esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(2), 42.0);
     esp_codec_dev_set_in_channel_gain(record_dev, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(3), 42.0);
 
     return ret_val;
@@ -400,10 +396,15 @@ esp_err_t bsp_get_feed_data(bool is_get_raw_channel, int16_t *buffer, int buffer
     ret = esp_codec_dev_read(record_dev, (void *)buffer, buffer_len);
     if (!is_get_raw_channel) {
         for (int i = 0; i < audio_chunksize; i++) {
+            // 原始顺序: [R, M0, M1, M2] -> 重排为 [M0, M1, M2, R]
             int16_t ref = buffer[4 * i + 0];
-            buffer[3 * i + 0] = buffer[4 * i + 1];
-            buffer[3 * i + 1] = buffer[4 * i + 3];
-            buffer[3 * i + 2] = ref;
+            int16_t m0 = buffer[4 * i + 1];
+            int16_t m1 = buffer[4 * i + 2];
+            int16_t m2 = buffer[4 * i + 3];
+            buffer[4 * i + 0] = m0;
+            buffer[4 * i + 1] = m1;
+            buffer[4 * i + 2] = m2;
+            buffer[4 * i + 3] = ref;
         }
     }
 
@@ -417,7 +418,8 @@ int bsp_get_feed_channel(void)
 
 char* bsp_get_input_format(void)
 {
-    return "RMNM";
+    // 与 is_get_raw_channel=true 的原始 feed 顺序一致
+    return "RMMM";
 }
 
 esp_err_t bsp_board_init(uint32_t sample_rate, int channel_format, int bits_per_chan)
