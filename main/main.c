@@ -16,6 +16,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/types.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -26,6 +28,7 @@
 #include "esp_afe_sr_models.h"
 #include "esp_mn_iface.h"
 #include "esp_mn_models.h"
+#include "esp_random.h"
 #include "esp_board_init.h"
 #include "model_path.h"
 #include "ringbuf.h"
@@ -35,7 +38,7 @@
 
 // ---------- 行为配置区 ----------
 // DOA 角度分辨率（度）：越小越细，但计算开销可能增加
-#define DOA_RESOLUTION_DEG           20.0f
+#define DOA_RESOLUTION_DEG           5.0f
 // 两个 DOA 麦克风之间的物理间距（米）
 #define DOA_MIC_DISTANCE_M           0.065f
 // 唤醒后回放窗口长度（毫秒）
@@ -47,9 +50,11 @@
 // 本示例采样率
 #define SAMPLE_RATE_HZ               16000
 // 回放通道索引（基于 raw feed 多通道顺序，RMMM 时: 0=R, 1=M0, 2=M1, 3=M2）
-#define RAW_PLAYBACK_FEED_CH_INDEX    3
+#define RAW_PLAYBACK_FEED_CH_INDEX    2
 // 每次唤醒时是否打印 raw 各通道电平统计（RMS/Peak），用于排查“某通道声音小”
 #define DEBUG_PRINT_WAKE_CHANNEL_LEVEL 1
+// 开启后：每次唤醒回放结束，将 g_raw_mic_ring 落盘到 /sdcard/doa/{随机数}.pcm
+#define DEBUG_DUMP_RAW_RING_TO_SDCARD 1
 
 static const esp_afe_sr_iface_t *afe_handle = NULL;
 static volatile int task_flag = 0;
@@ -283,6 +288,54 @@ static float estimate_wake_doa_from_recent(int window_samples, int left_ch, int 
     return doa_sum / doa_count;
 }
 
+static void dump_raw_ring_to_sdcard_pcm(void)
+{
+#if DEBUG_DUMP_RAW_RING_TO_SDCARD
+    if (!g_raw_mic_ring || g_feed_channel_count <= 0 || g_raw_mic_ring_len <= 0) {
+        return;
+    }
+
+    int max_frames = g_raw_mic_ring_len / g_feed_channel_count;
+    if (max_frames <= 0) {
+        return;
+    }
+
+    int16_t *snapshot = malloc(g_raw_mic_ring_len * sizeof(int16_t));
+    if (!snapshot) {
+        printf("dump pcm: alloc snapshot failed\n");
+        return;
+    }
+
+    int copied_frames = raw_mic_ring_copy_recent_interleaved(snapshot, max_frames, g_feed_channel_count);
+    if (copied_frames <= 0) {
+        free(snapshot);
+        return;
+    }
+
+    mkdir("/sdcard/doa", 0777);
+    char path[64];
+    snprintf(path, sizeof(path), "/sdcard/doa/%08lx.pcm", (unsigned long)esp_random());
+
+    FILE *fp = fopen(path, "wb");
+    if (!fp) {
+        printf("dump pcm: open failed: %s\n", path);
+        free(snapshot);
+        return;
+    }
+
+    size_t values = (size_t)copied_frames * (size_t)g_feed_channel_count;
+    size_t written = fwrite(snapshot, sizeof(int16_t), values, fp);
+    fclose(fp);
+    free(snapshot);
+
+    if (written != values) {
+        printf("dump pcm: write short %u/%u: %s\n", (unsigned)written, (unsigned)values, path);
+    } else {
+        printf("dump pcm ok: %s, frames=%d, ch=%d\n", path, copied_frames, g_feed_channel_count);
+    }
+#endif
+}
+
 void feed_Task(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
@@ -378,6 +431,7 @@ void detect_Task(void *arg)
             // 回放源：raw ring 指定通道（原始麦克风数据），不是 AFE 单声道输出
             int replay_samples = raw_mic_ring_copy_recent_channel(replay_linear, replay_total_samples, g_playback_ch_idx);
             if (replay_samples > 0) {
+                dump_raw_ring_to_sdcard_pcm();
                 // esp_audio_play 的长度单位是“字节”
                 esp_audio_play(replay_linear, replay_samples * sizeof(int16_t), portMAX_DELAY);
             }
@@ -401,6 +455,7 @@ void app_main()
 {
     // DAC 初始化在板级里完成，这里再显式把播放音量拉到最大（通常 100）
     ESP_ERROR_CHECK(esp_board_init(16000, 1, 16));
+    ESP_ERROR_CHECK(esp_sdcard_init("/sdcard", 10));
     ESP_ERROR_CHECK(esp_audio_set_play_vol(100));
 
     // 初始化语音模型与 AFE
