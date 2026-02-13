@@ -20,6 +20,7 @@
 #include <sys/types.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/event_groups.h"
 
 #include "esp_wn_iface.h"
 #include "esp_wn_models.h"
@@ -29,6 +30,12 @@
 #include "esp_mn_iface.h"
 #include "esp_mn_models.h"
 #include "esp_random.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_wifi.h"
+#include "nvs_flash.h"
+#include "lwip/inet.h"
+#include "lwip/sockets.h"
 #include "esp_board_init.h"
 #include "model_path.h"
 #include "ringbuf.h"
@@ -54,7 +61,13 @@
 // 每次唤醒时是否打印 raw 各通道电平统计（RMS/Peak），用于排查“某通道声音小”
 #define DEBUG_PRINT_WAKE_CHANNEL_LEVEL 1
 // 开启后：每次唤醒回放结束，将 g_raw_mic_ring 落盘到 /sdcard/doa/{随机数}.pcm
-#define DEBUG_DUMP_RAW_RING_TO_SDCARD 1
+#define DEBUG_DUMP_RAW_RING_TO_SDCARD 0
+// 开启后：连接 WiFi 并将唤醒窗口多通道 PCM 上传到云端 DOA 服务
+#define ENABLE_CLOUD_DOA_SEND 1
+#define CLOUD_WIFI_SSID       "SSID"
+#define CLOUD_WIFI_PASSWORD   "PASSWORD"
+#define CLOUD_SERVER_IP       "IP_ADDRESS"
+#define CLOUD_SERVER_PORT     5001
 
 static const esp_afe_sr_iface_t *afe_handle = NULL;
 static volatile int task_flag = 0;
@@ -67,6 +80,20 @@ static int g_mic_idx_left = 0;
 static int g_mic_idx_right = 1;
 // 回放使用的通道索引（可宏配置）
 static int g_playback_ch_idx = 0;
+#if ENABLE_CLOUD_DOA_SEND
+static EventGroupHandle_t s_wifi_event_group = NULL;
+#define WIFI_CONNECTED_BIT BIT0
+#endif
+
+typedef struct __attribute__((packed)) {
+    char magic[4];          // "DOA1"
+    uint32_t sample_rate;   // network byte order
+    uint32_t channels;      // network byte order
+    uint32_t mic_left;      // network byte order, 0-based
+    uint32_t mic_right;     // network byte order, 0-based
+    uint32_t frame_count;   // network byte order
+    uint32_t payload_bytes; // network byte order
+} doa_cloud_header_t;
 
 /**
  * 缓存最近一段“原始多通道”数据，用于：
@@ -336,6 +363,154 @@ static void dump_raw_ring_to_sdcard_pcm(void)
 #endif
 }
 
+#if ENABLE_CLOUD_DOA_SEND
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    (void)arg;
+    (void)event_data;
+    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
+        esp_wifi_connect();
+    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
+        xEventGroupClearBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+        esp_wifi_connect();
+    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
+        xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
+    }
+}
+
+static esp_err_t wifi_sta_init(void)
+{
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
+
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+
+    s_wifi_event_group = xEventGroupCreate();
+    if (!s_wifi_event_group) {
+        return ESP_FAIL;
+    }
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
+            .sae_pwe_h2e = WPA3_SAE_PWE_BOTH,
+        },
+    };
+    strncpy((char *)wifi_config.sta.ssid, CLOUD_WIFI_SSID, sizeof(wifi_config.sta.ssid) - 1);
+    strncpy((char *)wifi_config.sta.password, CLOUD_WIFI_PASSWORD, sizeof(wifi_config.sta.password) - 1);
+
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+
+    EventBits_t bits = xEventGroupWaitBits(s_wifi_event_group, WIFI_CONNECTED_BIT, pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
+    if (!(bits & WIFI_CONNECTED_BIT)) {
+        printf("wifi connect timeout\n");
+        return ESP_ERR_TIMEOUT;
+    }
+
+    printf("wifi connected: ssid=%s\n", CLOUD_WIFI_SSID);
+    return ESP_OK;
+}
+
+static int socket_send_all(int sockfd, const uint8_t *data, int len)
+{
+    int sent = 0;
+    while (sent < len) {
+        int n = send(sockfd, data + sent, len - sent, 0);
+        if (n <= 0) {
+            return -1;
+        }
+        sent += n;
+    }
+    return sent;
+}
+
+static void send_raw_ring_to_cloud(void)
+{
+    if (!g_raw_mic_ring || g_feed_channel_count <= 0 || g_raw_mic_ring_len <= 0) {
+        return;
+    }
+
+    EventBits_t bits = xEventGroupGetBits(s_wifi_event_group);
+    if (!(bits & WIFI_CONNECTED_BIT)) {
+        return;
+    }
+
+    int max_frames = g_raw_mic_ring_len / g_feed_channel_count;
+    if (max_frames <= 0) {
+        return;
+    }
+
+    int16_t *snapshot = malloc(g_raw_mic_ring_len * sizeof(int16_t));
+    if (!snapshot) {
+        return;
+    }
+
+    int copied_frames = raw_mic_ring_copy_recent_interleaved(snapshot, max_frames, g_feed_channel_count);
+    if (copied_frames <= 0) {
+        free(snapshot);
+        return;
+    }
+
+    int payload_bytes = copied_frames * g_feed_channel_count * (int)sizeof(int16_t);
+    doa_cloud_header_t hdr = {
+        .magic = {'D', 'O', 'A', '1'},
+        .sample_rate = htonl(SAMPLE_RATE_HZ),
+        .channels = htonl((uint32_t)g_feed_channel_count),
+        .mic_left = htonl((uint32_t)g_mic_idx_left),
+        .mic_right = htonl((uint32_t)g_mic_idx_right),
+        .frame_count = htonl((uint32_t)copied_frames),
+        .payload_bytes = htonl((uint32_t)payload_bytes),
+    };
+
+    int sockfd = socket(AF_INET, SOCK_STREAM, IPPROTO_IP);
+    if (sockfd < 0) {
+        free(snapshot);
+        return;
+    }
+
+    struct sockaddr_in dest_addr = {0};
+    dest_addr.sin_family = AF_INET;
+    dest_addr.sin_port = htons(CLOUD_SERVER_PORT);
+    dest_addr.sin_addr.s_addr = inet_addr(CLOUD_SERVER_IP);
+
+    if (connect(sockfd, (struct sockaddr *)&dest_addr, sizeof(dest_addr)) != 0) {
+        close(sockfd);
+        free(snapshot);
+        return;
+    }
+
+    int ok = 1;
+    if (socket_send_all(sockfd, (const uint8_t *)&hdr, sizeof(hdr)) < 0) {
+        ok = 0;
+    } else if (socket_send_all(sockfd, (const uint8_t *)snapshot, payload_bytes) < 0) {
+        ok = 0;
+    }
+    close(sockfd);
+    free(snapshot);
+
+    if (ok) {
+        printf("cloud send ok: %s:%d frames=%d ch=%d\n",
+               CLOUD_SERVER_IP, CLOUD_SERVER_PORT, copied_frames, g_feed_channel_count);
+    } else {
+        printf("cloud send failed\n");
+    }
+}
+#endif
+
 void feed_Task(void *arg)
 {
     esp_afe_sr_data_t *afe_data = arg;
@@ -432,6 +607,9 @@ void detect_Task(void *arg)
             int replay_samples = raw_mic_ring_copy_recent_channel(replay_linear, replay_total_samples, g_playback_ch_idx);
             if (replay_samples > 0) {
                 dump_raw_ring_to_sdcard_pcm();
+#if ENABLE_CLOUD_DOA_SEND
+                send_raw_ring_to_cloud();
+#endif
                 // esp_audio_play 的长度单位是“字节”
                 esp_audio_play(replay_linear, replay_samples * sizeof(int16_t), portMAX_DELAY);
             }
@@ -456,6 +634,9 @@ void app_main()
     // DAC 初始化在板级里完成，这里再显式把播放音量拉到最大（通常 100）
     ESP_ERROR_CHECK(esp_board_init(16000, 1, 16));
     ESP_ERROR_CHECK(esp_sdcard_init("/sdcard", 10));
+#if ENABLE_CLOUD_DOA_SEND
+    ESP_ERROR_CHECK(wifi_sta_init());
+#endif
     ESP_ERROR_CHECK(esp_audio_set_play_vol(100));
 
     // 初始化语音模型与 AFE
